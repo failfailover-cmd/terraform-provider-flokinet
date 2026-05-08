@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +18,12 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+)
+
+const (
+	flokiMaxRetries  = 6
+	flokiBaseBackoff = 1200 * time.Millisecond
+	flokiMaxBackoff  = 20 * time.Second
 )
 
 var _ resource.Resource = &addonDomainResource{}
@@ -120,8 +128,9 @@ func (r *addonDomainResource) addAddonDomain(ctx context.Context, d addonDomainM
 	if err != nil {
 		return err
 	}
-	if !strings.Contains(body, "\"result\":1") && !strings.Contains(strings.ToLower(body), "already exists") {
-		return fmt.Errorf("unexpected response: %s", body)
+	ok, msg := parseCPanelResult(body)
+	if !ok && !strings.Contains(strings.ToLower(msg), "already exists") {
+		return fmt.Errorf("addaddondomain failed: %s; raw=%s", msg, body)
 	}
 	return nil
 }
@@ -134,8 +143,20 @@ func (r *addonDomainResource) delAddonDomain(ctx context.Context, domain, subdom
 	q.Set("cpanel_jsonapi_func", "deladdondomain")
 	q.Set("domain", domain)
 	q.Set("subdomain", subdomain)
-	_, _, err := r.call(ctx, "POST", "/json-api/cpanel", q)
-	return err
+	_, body, err := r.call(ctx, "POST", "/json-api/cpanel", q)
+	if err != nil {
+		return err
+	}
+	ok, msg := parseCPanelResult(body)
+	if !ok {
+		// cPanel может вернуть warning, если домен уже отсутствует
+		m := strings.ToLower(msg)
+		if strings.Contains(m, "does not exist") || strings.Contains(m, "not found") {
+			return nil
+		}
+		return fmt.Errorf("deladdondomain failed: %s; raw=%s", msg, body)
+	}
+	return nil
 }
 
 func (r *addonDomainResource) domainExists(ctx context.Context, domain string) (bool, error) {
@@ -143,20 +164,16 @@ func (r *addonDomainResource) domainExists(ctx context.Context, domain string) (
 	if err != nil {
 		return false, err
 	}
-	var out map[string]any
+	var out struct {
+		Data struct {
+			AddonDomains []string `json:"addon_domains"`
+		} `json:"data"`
+	}
 	if err := json.Unmarshal([]byte(body), &out); err != nil {
-		return strings.Contains(body, domain), nil
+		return strings.Contains(strings.ToLower(body), strings.ToLower(domain)), nil
 	}
-	rawData, ok := out["data"].(map[string]any)
-	if !ok {
-		return strings.Contains(body, domain), nil
-	}
-	arr, ok := rawData["addon_domains"].([]any)
-	if !ok {
-		return strings.Contains(body, domain), nil
-	}
-	for _, x := range arr {
-		if s, ok := x.(string); ok && strings.EqualFold(s, domain) {
+	for _, s := range out.Data.AddonDomains {
+		if strings.EqualFold(s, domain) {
 			return true, nil
 		}
 	}
@@ -165,27 +182,109 @@ func (r *addonDomainResource) domainExists(ctx context.Context, domain string) (
 
 func (r *addonDomainResource) call(ctx context.Context, method, p string, q url.Values) (int, string, error) {
 	u := fmt.Sprintf("https://%s:%d%s", r.cfg.Host, r.cfg.Port, p)
-	var body io.Reader
+	encodedBody := ""
 	if method == "GET" && len(q) > 0 {
 		u += "?" + q.Encode()
 	}
 	if method == "POST" {
-		body = strings.NewReader(q.Encode())
+		encodedBody = q.Encode()
 	}
-	req, _ := http.NewRequestWithContext(ctx, method, u, body)
-	req.Header.Set("Authorization", fmt.Sprintf("cpanel %s:%s", r.cfg.Username, r.cfg.APIToken))
-	if method == "POST" {
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	var lastErr error
+	for attempt := 0; attempt <= flokiMaxRetries; attempt++ {
+		var body io.Reader
+		if method == "POST" {
+			body = strings.NewReader(encodedBody)
+		}
+		req, _ := http.NewRequestWithContext(ctx, method, u, body)
+		req.Header.Set("Authorization", fmt.Sprintf("cpanel %s:%s", r.cfg.Username, r.cfg.APIToken))
+		if method == "POST" {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+
+		cli := &http.Client{Timeout: 45 * time.Second}
+		res, err := cli.Do(req)
+		if err != nil {
+			lastErr = err
+			if !isRetryableNetErr(err) || attempt == flokiMaxRetries {
+				return 0, "", err
+			}
+			time.Sleep(backoff(attempt, ""))
+			continue
+		}
+
+		raw, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		bodyStr := string(raw)
+
+		if retryableStatus(res.StatusCode) && attempt < flokiMaxRetries {
+			time.Sleep(backoff(attempt, res.Header.Get("Retry-After")))
+			continue
+		}
+		if res.StatusCode < 200 || res.StatusCode >= 300 {
+			return res.StatusCode, bodyStr, fmt.Errorf("status=%d body=%s", res.StatusCode, bodyStr)
+		}
+		return res.StatusCode, bodyStr, nil
 	}
-	cli := &http.Client{Timeout: 45 * time.Second}
-	res, err := cli.Do(req)
-	if err != nil {
-		return 0, "", err
+	return 0, "", fmt.Errorf("request retries exhausted: %w", lastErr)
+}
+
+func parseCPanelResult(raw string) (bool, string) {
+	var payload struct {
+		CPanelResult struct {
+			Data []struct {
+				Result int    `json:"result"`
+				Reason string `json:"reason"`
+			} `json:"data"`
+			Error string `json:"error"`
+		} `json:"cpanelresult"`
 	}
-	defer res.Body.Close()
-	raw, _ := io.ReadAll(res.Body)
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return res.StatusCode, string(raw), fmt.Errorf("status=%d body=%s", res.StatusCode, string(raw))
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		if strings.Contains(raw, "\"result\":1") {
+			return true, ""
+		}
+		return false, "unparseable cPanel response"
 	}
-	return res.StatusCode, string(raw), nil
+	if payload.CPanelResult.Error != "" {
+		return false, payload.CPanelResult.Error
+	}
+	if len(payload.CPanelResult.Data) == 0 {
+		return false, "empty cpanelresult.data"
+	}
+	if payload.CPanelResult.Data[0].Result == 1 {
+		return true, payload.CPanelResult.Data[0].Reason
+	}
+	return false, payload.CPanelResult.Data[0].Reason
+}
+
+func retryableStatus(code int) bool {
+	if code == http.StatusTooManyRequests || code == 1015 {
+		return true
+	}
+	return code >= 500 && code <= 599
+}
+
+func isRetryableNetErr(err error) bool {
+	if nerr, ok := err.(net.Error); ok {
+		return nerr.Timeout() || nerr.Temporary()
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "timeout") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe")
+}
+
+func backoff(attempt int, retryAfter string) time.Duration {
+	if retryAfter != "" {
+		if sec, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && sec > 0 {
+			d := time.Duration(sec) * time.Second
+			if d > flokiMaxBackoff {
+				return flokiMaxBackoff
+			}
+			return d
+		}
+	}
+	d := flokiBaseBackoff * (1 << attempt)
+	if d > flokiMaxBackoff {
+		return flokiMaxBackoff
+	}
+	return d
 }
