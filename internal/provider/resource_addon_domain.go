@@ -20,12 +20,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
-const (
-	flokiMaxRetries  = 6
-	flokiBaseBackoff = 1200 * time.Millisecond
-	flokiMaxBackoff  = 20 * time.Second
-)
-
 var _ resource.Resource = &addonDomainResource{}
 var _ resource.ResourceWithImportState = &addonDomainResource{}
 
@@ -191,7 +185,7 @@ func (r *addonDomainResource) call(ctx context.Context, method, p string, q url.
 	}
 
 	var lastErr error
-	for attempt := 0; attempt <= flokiMaxRetries; attempt++ {
+	for attempt := 0; attempt <= r.cfg.MaxRetries; attempt++ {
 		var body io.Reader
 		if method == "POST" {
 			body = strings.NewReader(encodedBody)
@@ -202,14 +196,14 @@ func (r *addonDomainResource) call(ctx context.Context, method, p string, q url.
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		}
 
-		cli := &http.Client{Timeout: 45 * time.Second}
+		cli := &http.Client{Timeout: r.cfg.RequestTimeout}
 		res, err := cli.Do(req)
 		if err != nil {
 			lastErr = err
-			if !isRetryableNetErr(err) || attempt == flokiMaxRetries {
+			if !isRetryableNetErr(err) || attempt == r.cfg.MaxRetries {
 				return 0, "", err
 			}
-			time.Sleep(backoff(attempt, ""))
+			time.Sleep(r.backoff(attempt, ""))
 			continue
 		}
 
@@ -217,8 +211,8 @@ func (r *addonDomainResource) call(ctx context.Context, method, p string, q url.
 		res.Body.Close()
 		bodyStr := string(raw)
 
-		if retryableStatus(res.StatusCode) && attempt < flokiMaxRetries {
-			time.Sleep(backoff(attempt, res.Header.Get("Retry-After")))
+		if retryableStatus(res.StatusCode) && attempt < r.cfg.MaxRetries {
+			time.Sleep(r.backoff(attempt, res.Header.Get("Retry-After")))
 			continue
 		}
 		if res.StatusCode < 200 || res.StatusCode >= 300 {
@@ -272,19 +266,19 @@ func isRetryableNetErr(err error) bool {
 	return strings.Contains(msg, "timeout") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe")
 }
 
-func backoff(attempt int, retryAfter string) time.Duration {
+func (r *addonDomainResource) backoff(attempt int, retryAfter string) time.Duration {
 	if retryAfter != "" {
 		if sec, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && sec > 0 {
 			d := time.Duration(sec) * time.Second
-			if d > flokiMaxBackoff {
-				return flokiMaxBackoff
+			if d > r.cfg.MaxBackoff {
+				return r.cfg.MaxBackoff
 			}
 			return d
 		}
 	}
-	d := flokiBaseBackoff * (1 << attempt)
-	if d > flokiMaxBackoff {
-		return flokiMaxBackoff
+	d := r.cfg.BaseBackoff * (1 << attempt)
+	if d > r.cfg.MaxBackoff {
+		return r.cfg.MaxBackoff
 	}
 	return d
 }
