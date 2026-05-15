@@ -23,6 +23,10 @@ type flokinetProviderModel struct {
 	Port           types.Int64  `tfsdk:"port"`
 	Username       types.String `tfsdk:"username"`
 	APIToken       types.String `tfsdk:"api_token"`
+	WHMHost        types.String `tfsdk:"whm_host"`
+	WHMPort        types.Int64  `tfsdk:"whm_port"`
+	WHMUsername    types.String `tfsdk:"whm_username"`
+	WHMAPIToken    types.String `tfsdk:"whm_api_token"`
 	MaxRetries     types.Int64  `tfsdk:"max_retries"`
 	BaseBackoffMS  types.Int64  `tfsdk:"base_backoff_ms"`
 	MaxBackoffMS   types.Int64  `tfsdk:"max_backoff_ms"`
@@ -34,6 +38,10 @@ type providerConfig struct {
 	Port           int64
 	Username       string
 	APIToken       string
+	WHMHost        string
+	WHMPort        int64
+	WHMUsername    string
+	WHMAPIToken    string
 	MaxRetries     int
 	BaseBackoff    time.Duration
 	MaxBackoff     time.Duration
@@ -55,6 +63,10 @@ func (p *flokinetProvider) Schema(_ context.Context, _ provider.SchemaRequest, r
 		"port":               schema.Int64Attribute{Optional: true, Description: "cPanel port. Env: FLOKI_CPANEL_PORT (default 2083)"},
 		"username":           schema.StringAttribute{Optional: true, Description: "cPanel username. Env: FLOKI_CPANEL_USERNAME"},
 		"api_token":          schema.StringAttribute{Optional: true, Sensitive: true, Description: "cPanel API token. Env: FLOKI_CPANEL_API_TOKEN"},
+		"whm_host":           schema.StringAttribute{Optional: true, Description: "WHM host for privileged delete fallback. Env: FLOKI_WHM_HOST"},
+		"whm_port":           schema.Int64Attribute{Optional: true, Description: "WHM port. Env: FLOKI_WHM_PORT (default 2087)"},
+		"whm_username":       schema.StringAttribute{Optional: true, Description: "WHM username (usually root/reseller). Env: FLOKI_WHM_USERNAME"},
+		"whm_api_token":      schema.StringAttribute{Optional: true, Sensitive: true, Description: "WHM API token for privileged delete fallback. Env: FLOKI_WHM_API_TOKEN"},
 		"max_retries":        schema.Int64Attribute{Optional: true, Description: "Retry count for 429/5xx/network errors. Default: 6"},
 		"base_backoff_ms":    schema.Int64Attribute{Optional: true, Description: "Base backoff in milliseconds. Default: 1200"},
 		"max_backoff_ms":     schema.Int64Attribute{Optional: true, Description: "Max backoff in milliseconds. Default: 20000"},
@@ -81,10 +93,26 @@ func (p *flokinetProvider) Configure(ctx context.Context, req provider.Configure
 	if !cfg.APIToken.IsNull() {
 		token = cfg.APIToken.ValueString()
 	}
+	whmHost := os.Getenv("FLOKI_WHM_HOST")
+	if !cfg.WHMHost.IsNull() {
+		whmHost = cfg.WHMHost.ValueString()
+	}
+	whmUser := os.Getenv("FLOKI_WHM_USERNAME")
+	if !cfg.WHMUsername.IsNull() {
+		whmUser = cfg.WHMUsername.ValueString()
+	}
+	whmToken := os.Getenv("FLOKI_WHM_API_TOKEN")
+	if !cfg.WHMAPIToken.IsNull() {
+		whmToken = cfg.WHMAPIToken.ValueString()
+	}
 
 	port := int64(envInt("FLOKI_CPANEL_PORT", 2083))
 	if !cfg.Port.IsNull() {
 		port = cfg.Port.ValueInt64()
+	}
+	whmPort := int64(envInt("FLOKI_WHM_PORT", 2087))
+	if !cfg.WHMPort.IsNull() {
+		whmPort = cfg.WHMPort.ValueInt64()
 	}
 
 	maxRetries := envInt("FLOKI_MAX_RETRIES", 6)
@@ -122,6 +150,10 @@ func (p *flokinetProvider) Configure(ctx context.Context, req provider.Configure
 		Port:           port,
 		Username:       username,
 		APIToken:       token,
+		WHMHost:        whmHost,
+		WHMPort:        whmPort,
+		WHMUsername:    whmUser,
+		WHMAPIToken:    whmToken,
 		MaxRetries:     maxRetries,
 		BaseBackoff:    time.Duration(baseBackoffMS) * time.Millisecond,
 		MaxBackoff:     time.Duration(maxBackoffMS) * time.Millisecond,

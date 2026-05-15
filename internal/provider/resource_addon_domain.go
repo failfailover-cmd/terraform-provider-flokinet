@@ -42,8 +42,8 @@ func (r *addonDomainResource) Schema(_ context.Context, _ resource.SchemaRequest
 	resp.Schema = schema.Schema{Attributes: map[string]schema.Attribute{
 		"id":        schema.StringAttribute{Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()}},
 		"domain":    schema.StringAttribute{Required: true, PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()}},
-		"subdomain": schema.StringAttribute{Optional: true, Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()}},
-		"docroot":   schema.StringAttribute{Optional: true, Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()}},
+		"subdomain": schema.StringAttribute{Optional: true, Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()}},
+		"docroot":   schema.StringAttribute{Optional: true, Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()}},
 	}}
 }
 
@@ -93,7 +93,18 @@ func (r *addonDomainResource) Read(ctx context.Context, req resource.ReadRequest
 	resp.Diagnostics.Append(resp.State.Set(ctx, &st)...)
 }
 
-func (r *addonDomainResource) Update(context.Context, resource.UpdateRequest, *resource.UpdateResponse) {
+func (r *addonDomainResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var plan addonDomainModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// AddonDomain API does not support safe in-place mutation of domain bindings.
+	// Keep provider idempotent by normalizing and syncing state only.
+	plan = r.normalizeAddonModel(plan)
+	plan.ID = plan.Domain
+	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
 func (r *addonDomainResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
@@ -160,14 +171,126 @@ func (r *addonDomainResource) delAddonDomain(ctx context.Context, domain, subdom
 	}
 	ok, msg := parseCPanelResult(body)
 	if !ok {
-		// cPanel может вернуть warning, если домен уже отсутствует
 		m := strings.ToLower(msg)
+		// cPanel может вернуть warning, если домен уже отсутствует
 		if strings.Contains(m, "does not exist") || strings.Contains(m, "not found") {
 			return nil
+		}
+		// На некоторых инсталляциях cPanel user-level API не может удалить addon.
+		// Пробуем privileged fallback через WHM API, если он настроен.
+		if r.canUseWHMDeleteFallback() && isCPDeletePermissionError(m) {
+			if err := r.whmDeleteAddonDomain(ctx, domain); err == nil {
+				return nil
+			}
 		}
 		return fmt.Errorf("deladdondomain failed: %s; raw=%s", msg, body)
 	}
 	return nil
+}
+
+func (r *addonDomainResource) canUseWHMDeleteFallback() bool {
+	return r.cfg.WHMHost != "" && r.cfg.WHMUsername != "" && r.cfg.WHMAPIToken != ""
+}
+
+func isCPDeletePermissionError(msgLower string) bool {
+	return strings.Contains(msgLower, "do not have control of the subdomain") ||
+		strings.Contains(msgLower, "does not correspond to") ||
+		strings.Contains(msgLower, "parked on top of it")
+}
+
+func (r *addonDomainResource) whmDeleteAddonDomain(ctx context.Context, domain string) error {
+	meta, err := r.fetchAddonDomainMeta(ctx, domain)
+	if err != nil {
+		return fmt.Errorf("whm fallback metadata lookup failed for %s: %w", domain, err)
+	}
+
+	// 1) Удаляем addon домен.
+	if err := r.callWHMDeleteDomain(ctx, domain); err != nil && !isWHMNotFound(err.Error()) {
+		return fmt.Errorf("whm delete addon domain %s failed: %w", domain, err)
+	}
+
+	// 2) По документации WHM нужно отдельно удалять связанный subdomain.
+	associatedSub := strings.TrimSpace(meta.FullSubdomain)
+	if associatedSub != "" {
+		if err := r.callWHMDeleteDomain(ctx, associatedSub); err != nil && !isWHMNotFound(err.Error()) {
+			return fmt.Errorf("whm delete associated subdomain %s failed: %w", associatedSub, err)
+		}
+	}
+
+	return nil
+}
+
+type addonDomainMeta struct {
+	Domain        string
+	FullSubdomain string
+}
+
+func (r *addonDomainResource) fetchAddonDomainMeta(ctx context.Context, domain string) (*addonDomainMeta, error) {
+	q := url.Values{}
+	q.Set("cpanel_jsonapi_user", r.cfg.Username)
+	q.Set("cpanel_jsonapi_apiversion", "2")
+	q.Set("cpanel_jsonapi_module", "AddonDomain")
+	q.Set("cpanel_jsonapi_func", "listaddondomains")
+	_, body, err := r.call(ctx, "GET", "/json-api/cpanel", q)
+	if err != nil {
+		return nil, err
+	}
+
+	var payload struct {
+		CPanelResult struct {
+			Data []struct {
+				Domain        string `json:"domain"`
+				FullSubdomain string `json:"fullsubdomain"`
+			} `json:"data"`
+		} `json:"cpanelresult"`
+	}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		return nil, fmt.Errorf("cannot parse listaddondomains response: %w", err)
+	}
+
+	for _, d := range payload.CPanelResult.Data {
+		if strings.EqualFold(d.Domain, domain) {
+			return &addonDomainMeta{
+				Domain:        d.Domain,
+				FullSubdomain: d.FullSubdomain,
+			}, nil
+		}
+	}
+	return &addonDomainMeta{Domain: domain}, nil
+}
+
+func (r *addonDomainResource) callWHMDeleteDomain(ctx context.Context, domain string) error {
+	q := url.Values{}
+	q.Set("api.version", "1")
+	q.Set("domain", domain)
+	_, body, err := r.callWHM(ctx, "GET", "/json-api/delete_domain", q)
+	if err != nil {
+		return err
+	}
+	if !whmDeleteSuccess(body) {
+		return fmt.Errorf("whm delete_domain unsuccessful for %s: %s", domain, body)
+	}
+	return nil
+}
+
+func whmDeleteSuccess(raw string) bool {
+	var payload struct {
+		Metadata struct {
+			Result int    `json:"result"`
+			Reason string `json:"reason"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return false
+	}
+	return payload.Metadata.Result == 1
+}
+
+func isWHMNotFound(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "does not exist") ||
+		strings.Contains(m, "not found") ||
+		strings.Contains(m, "is not configured")
 }
 
 func (r *addonDomainResource) domainExists(ctx context.Context, domain string) (bool, error) {
@@ -209,6 +332,55 @@ func (r *addonDomainResource) call(ctx context.Context, method, p string, q url.
 		}
 		req, _ := http.NewRequestWithContext(ctx, method, u, body)
 		req.Header.Set("Authorization", fmt.Sprintf("cpanel %s:%s", r.cfg.Username, r.cfg.APIToken))
+		if method == "POST" {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+
+		cli := &http.Client{Timeout: r.cfg.RequestTimeout}
+		res, err := cli.Do(req)
+		if err != nil {
+			lastErr = err
+			if !isRetryableNetErr(err) || attempt == r.cfg.MaxRetries {
+				return 0, "", err
+			}
+			time.Sleep(r.backoff(attempt, ""))
+			continue
+		}
+
+		raw, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		bodyStr := string(raw)
+
+		if retryableStatus(res.StatusCode) && attempt < r.cfg.MaxRetries {
+			time.Sleep(r.backoff(attempt, res.Header.Get("Retry-After")))
+			continue
+		}
+		if res.StatusCode < 200 || res.StatusCode >= 300 {
+			return res.StatusCode, bodyStr, fmt.Errorf("status=%d body=%s", res.StatusCode, bodyStr)
+		}
+		return res.StatusCode, bodyStr, nil
+	}
+	return 0, "", fmt.Errorf("request retries exhausted: %w", lastErr)
+}
+
+func (r *addonDomainResource) callWHM(ctx context.Context, method, p string, q url.Values) (int, string, error) {
+	u := fmt.Sprintf("https://%s:%d%s", r.cfg.WHMHost, r.cfg.WHMPort, p)
+	encodedBody := ""
+	if method == "GET" && len(q) > 0 {
+		u += "?" + q.Encode()
+	}
+	if method == "POST" {
+		encodedBody = q.Encode()
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= r.cfg.MaxRetries; attempt++ {
+		var body io.Reader
+		if method == "POST" {
+			body = strings.NewReader(encodedBody)
+		}
+		req, _ := http.NewRequestWithContext(ctx, method, u, body)
+		req.Header.Set("Authorization", fmt.Sprintf("whm %s:%s", r.cfg.WHMUsername, r.cfg.WHMAPIToken))
 		if method == "POST" {
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		}
