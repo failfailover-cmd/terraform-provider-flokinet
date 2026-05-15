@@ -42,8 +42,8 @@ func (r *addonDomainResource) Schema(_ context.Context, _ resource.SchemaRequest
 	resp.Schema = schema.Schema{Attributes: map[string]schema.Attribute{
 		"id":        schema.StringAttribute{Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()}},
 		"domain":    schema.StringAttribute{Required: true, PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()}},
-		"subdomain": schema.StringAttribute{Required: true, PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()}},
-		"docroot":   schema.StringAttribute{Required: true, PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()}},
+		"subdomain": schema.StringAttribute{Optional: true, Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()}},
+		"docroot":   schema.StringAttribute{Optional: true, Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()}},
 	}}
 }
 
@@ -65,6 +65,7 @@ func (r *addonDomainResource) Create(ctx context.Context, req resource.CreateReq
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	plan = r.normalizeAddonModel(plan)
 	if err := r.addAddonDomain(ctx, plan); err != nil {
 		resp.Diagnostics.AddError("Floki API error", err.Error())
 		return
@@ -88,6 +89,7 @@ func (r *addonDomainResource) Read(ctx context.Context, req resource.ReadRequest
 		resp.State.RemoveResource(ctx)
 		return
 	}
+	st = r.normalizeAddonModel(st)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &st)...)
 }
 
@@ -107,6 +109,21 @@ func (r *addonDomainResource) Delete(ctx context.Context, req resource.DeleteReq
 
 func (r *addonDomainResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	resource.ImportStatePassthroughID(ctx, path.Root("domain"), req, resp)
+}
+
+func (r *addonDomainResource) normalizeAddonModel(m addonDomainModel) addonDomainModel {
+	domain := strings.TrimSpace(m.Domain.ValueString())
+	if domain == "" {
+		return m
+	}
+
+	if m.Sub.IsNull() || m.Sub.IsUnknown() || strings.TrimSpace(m.Sub.ValueString()) == "" {
+		m.Sub = types.StringValue(strings.ReplaceAll(domain, ".", "-"))
+	}
+	if m.Docroot.IsNull() || m.Docroot.IsUnknown() || strings.TrimSpace(m.Docroot.ValueString()) == "" {
+		m.Docroot = types.StringValue(fmt.Sprintf("/home/%s/root/sites/%s", r.cfg.Username, domain))
+	}
+	return m
 }
 
 func (r *addonDomainResource) addAddonDomain(ctx context.Context, d addonDomainModel) error {
