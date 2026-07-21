@@ -23,6 +23,7 @@ type flokinetProviderModel struct {
 	Port           types.Int64  `tfsdk:"port"`
 	Username       types.String `tfsdk:"username"`
 	APIToken       types.String `tfsdk:"api_token"`
+	TLSServerName  types.String `tfsdk:"tls_server_name"`
 	WHMHost        types.String `tfsdk:"whm_host"`
 	WHMPort        types.Int64  `tfsdk:"whm_port"`
 	WHMUsername    types.String `tfsdk:"whm_username"`
@@ -38,6 +39,7 @@ type providerConfig struct {
 	Port           int64
 	Username       string
 	APIToken       string
+	TLSServerName  string
 	WHMHost        string
 	WHMPort        int64
 	WHMUsername    string
@@ -63,6 +65,7 @@ func (p *flokinetProvider) Schema(_ context.Context, _ provider.SchemaRequest, r
 		"port":               schema.Int64Attribute{Optional: true, Description: "cPanel port. Env: FLOKI_CPANEL_PORT (default 2083)"},
 		"username":           schema.StringAttribute{Optional: true, Description: "cPanel username. Env: FLOKI_CPANEL_USERNAME"},
 		"api_token":          schema.StringAttribute{Optional: true, Sensitive: true, Description: "cPanel API token. Env: FLOKI_CPANEL_API_TOKEN"},
+		"tls_server_name":    schema.StringAttribute{Optional: true, Description: "TLS server name used when the cPanel host is an IP address. Env: FLOKI_TLS_SERVER_NAME"},
 		"whm_host":           schema.StringAttribute{Optional: true, Description: "WHM host for privileged delete fallback. Env: FLOKI_WHM_HOST"},
 		"whm_port":           schema.Int64Attribute{Optional: true, Description: "WHM port. Env: FLOKI_WHM_PORT (default 2087)"},
 		"whm_username":       schema.StringAttribute{Optional: true, Description: "WHM username (usually root/reseller). Env: FLOKI_WHM_USERNAME"},
@@ -92,6 +95,10 @@ func (p *flokinetProvider) Configure(ctx context.Context, req provider.Configure
 	token := os.Getenv("FLOKI_CPANEL_API_TOKEN")
 	if !cfg.APIToken.IsNull() {
 		token = cfg.APIToken.ValueString()
+	}
+	tlsServerName := os.Getenv("FLOKI_TLS_SERVER_NAME")
+	if !cfg.TLSServerName.IsNull() {
+		tlsServerName = cfg.TLSServerName.ValueString()
 	}
 	whmHost := os.Getenv("FLOKI_WHM_HOST")
 	if !cfg.WHMHost.IsNull() {
@@ -150,6 +157,7 @@ func (p *flokinetProvider) Configure(ctx context.Context, req provider.Configure
 		Port:           port,
 		Username:       username,
 		APIToken:       token,
+		TLSServerName:  tlsServerName,
 		WHMHost:        whmHost,
 		WHMPort:        whmPort,
 		WHMUsername:    whmUser,
