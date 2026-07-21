@@ -36,3 +36,16 @@ func TestHTTPClientKeepsDefaultTLSConfigWithoutServerName(t *testing.T) {
 		t.Fatal("InsecureSkipVerify = true, want false")
 	}
 }
+
+func TestDeleteSubdomainPrefersLiveFullSubdomain(t *testing.T) {
+	meta := &addonDomainMeta{FullSubdomain: "birdiecupeatery-com-au.kokobetdeposit.com"}
+	if got := deleteSubdomain("birdiecupeatery-com-au", meta); got != meta.FullSubdomain {
+		t.Fatalf("deleteSubdomain() = %q, want %q", got, meta.FullSubdomain)
+	}
+}
+
+func TestDeleteSubdomainFallsBackToStateValue(t *testing.T) {
+	if got := deleteSubdomain("intechs-com-au", &addonDomainMeta{}); got != "intechs-com-au" {
+		t.Fatalf("deleteSubdomain() = %q, want state value", got)
+	}
+}

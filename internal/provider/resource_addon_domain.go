@@ -114,7 +114,15 @@ func (r *addonDomainResource) Delete(ctx context.Context, req resource.DeleteReq
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	if err := r.delAddonDomain(ctx, st.Domain.ValueString(), st.Sub.ValueString()); err != nil {
+
+	domain := st.Domain.ValueString()
+	meta, err := r.fetchAddonDomainMeta(ctx, domain)
+	if err != nil {
+		resp.Diagnostics.AddError("Floki API error", fmt.Sprintf("Unable to read addon-domain mapping for %s: %s", domain, err))
+		return
+	}
+
+	if err := r.delAddonDomain(ctx, domain, deleteSubdomain(st.Sub.ValueString(), meta)); err != nil {
 		resp.Diagnostics.AddError("Floki API error", err.Error())
 	}
 }
@@ -224,6 +232,13 @@ func (r *addonDomainResource) whmDeleteAddonDomain(ctx context.Context, domain s
 type addonDomainMeta struct {
 	Domain        string
 	FullSubdomain string
+}
+
+func deleteSubdomain(stateSubdomain string, meta *addonDomainMeta) string {
+	if meta != nil && strings.TrimSpace(meta.FullSubdomain) != "" {
+		return strings.TrimSpace(meta.FullSubdomain)
+	}
+	return stateSubdomain
 }
 
 func (r *addonDomainResource) fetchAddonDomainMeta(ctx context.Context, domain string) (*addonDomainMeta, error) {
