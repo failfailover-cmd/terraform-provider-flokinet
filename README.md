@@ -16,6 +16,8 @@ provider "flokinet" {
   port      = 2083
   username  = var.floki_cpanel_username
   api_token = var.floki_cpanel_api_token
+  # For an IP endpoint, keep TLS validation on by setting the certificate hostname.
+  tls_server_name = "ro9.flokinet.is"
 
   # optional: privileged fallback for delete via WHM API
   whm_host      = var.floki_whm_host

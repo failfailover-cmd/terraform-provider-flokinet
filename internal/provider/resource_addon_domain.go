@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -336,7 +337,7 @@ func (r *addonDomainResource) call(ctx context.Context, method, p string, q url.
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		}
 
-		cli := &http.Client{Timeout: r.cfg.RequestTimeout}
+		cli := r.httpClient()
 		res, err := cli.Do(req)
 		if err != nil {
 			lastErr = err
@@ -385,7 +386,7 @@ func (r *addonDomainResource) callWHM(ctx context.Context, method, p string, q u
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		}
 
-		cli := &http.Client{Timeout: r.cfg.RequestTimeout}
+		cli := r.httpClient()
 		res, err := cli.Do(req)
 		if err != nil {
 			lastErr = err
@@ -410,6 +411,18 @@ func (r *addonDomainResource) callWHM(ctx context.Context, method, p string, q u
 		return res.StatusCode, bodyStr, nil
 	}
 	return 0, "", fmt.Errorf("request retries exhausted: %w", lastErr)
+}
+
+func (r *addonDomainResource) httpClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if r.cfg.TLSServerName != "" {
+		transport.TLSClientConfig = &tls.Config{ServerName: r.cfg.TLSServerName}
+	}
+
+	return &http.Client{
+		Timeout:   r.cfg.RequestTimeout,
+		Transport: transport,
+	}
 }
 
 func parseCPanelResult(raw string) (bool, string) {
