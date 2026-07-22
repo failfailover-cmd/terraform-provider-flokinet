@@ -52,7 +52,7 @@ type providerConfig struct {
 
 	addonDomainsMu     sync.Mutex
 	addonDomainsLoaded bool
-	addonDomains       map[string]struct{}
+	addonDomains       map[string]addonDomainMeta
 }
 
 func New(version string) func() provider.Provider {

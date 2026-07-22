@@ -245,6 +245,24 @@ func deleteSubdomain(stateSubdomain string, meta *addonDomainMeta) string {
 }
 
 func (r *addonDomainResource) fetchAddonDomainMeta(ctx context.Context, domain string) (*addonDomainMeta, error) {
+	addonDomains, err := r.loadAddonDomains(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if meta, ok := addonDomains[normalizeDomainKey(domain)]; ok {
+		return &meta, nil
+	}
+	return &addonDomainMeta{Domain: domain}, nil
+}
+
+func (r *addonDomainResource) loadAddonDomains(ctx context.Context) (map[string]addonDomainMeta, error) {
+	r.cfg.addonDomainsMu.Lock()
+	defer r.cfg.addonDomainsMu.Unlock()
+
+	if r.cfg.addonDomainsLoaded {
+		return r.cfg.addonDomains, nil
+	}
+
 	q := url.Values{}
 	q.Set("cpanel_jsonapi_user", r.cfg.Username)
 	q.Set("cpanel_jsonapi_apiversion", "2")
@@ -255,6 +273,16 @@ func (r *addonDomainResource) fetchAddonDomainMeta(ctx context.Context, domain s
 		return nil, err
 	}
 
+	addonDomains, err := parseAddonDomainList(body)
+	if err != nil {
+		return nil, err
+	}
+	r.cfg.addonDomains = addonDomains
+	r.cfg.addonDomainsLoaded = true
+	return r.cfg.addonDomains, nil
+}
+
+func parseAddonDomainList(body string) (map[string]addonDomainMeta, error) {
 	var payload struct {
 		CPanelResult struct {
 			Data []struct {
@@ -267,15 +295,14 @@ func (r *addonDomainResource) fetchAddonDomainMeta(ctx context.Context, domain s
 		return nil, fmt.Errorf("cannot parse listaddondomains response: %w", err)
 	}
 
+	addonDomains := make(map[string]addonDomainMeta, len(payload.CPanelResult.Data))
 	for _, d := range payload.CPanelResult.Data {
-		if strings.EqualFold(d.Domain, domain) {
-			return &addonDomainMeta{
-				Domain:        d.Domain,
-				FullSubdomain: d.FullSubdomain,
-			}, nil
+		addonDomains[normalizeDomainKey(d.Domain)] = addonDomainMeta{
+			Domain:        d.Domain,
+			FullSubdomain: d.FullSubdomain,
 		}
 	}
-	return &addonDomainMeta{Domain: domain}, nil
+	return addonDomains, nil
 }
 
 func (r *addonDomainResource) callWHMDeleteDomain(ctx context.Context, domain string) error {
@@ -313,33 +340,11 @@ func isWHMNotFound(msg string) bool {
 }
 
 func (r *addonDomainResource) domainExists(ctx context.Context, domain string) (bool, error) {
-	r.cfg.addonDomainsMu.Lock()
-	defer r.cfg.addonDomainsMu.Unlock()
-
-	if r.cfg.addonDomainsLoaded {
-		_, ok := r.cfg.addonDomains[normalizeDomainKey(domain)]
-		return ok, nil
-	}
-
-	_, body, err := r.call(ctx, "GET", "/execute/DomainInfo/list_domains", nil)
+	addonDomains, err := r.loadAddonDomains(ctx)
 	if err != nil {
 		return false, err
 	}
-	var out struct {
-		Data struct {
-			AddonDomains []string `json:"addon_domains"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(body), &out); err != nil {
-		return strings.Contains(strings.ToLower(body), strings.ToLower(domain)), nil
-	}
-
-	r.cfg.addonDomains = make(map[string]struct{}, len(out.Data.AddonDomains))
-	for _, s := range out.Data.AddonDomains {
-		r.cfg.addonDomains[normalizeDomainKey(s)] = struct{}{}
-	}
-	r.cfg.addonDomainsLoaded = true
-	_, ok := r.cfg.addonDomains[normalizeDomainKey(domain)]
+	_, ok := addonDomains[normalizeDomainKey(domain)]
 	return ok, nil
 }
 
@@ -347,7 +352,7 @@ func (r *addonDomainResource) rememberAddonDomain(domain string) {
 	r.cfg.addonDomainsMu.Lock()
 	defer r.cfg.addonDomainsMu.Unlock()
 	if r.cfg.addonDomainsLoaded {
-		r.cfg.addonDomains[normalizeDomainKey(domain)] = struct{}{}
+		r.cfg.addonDomains[normalizeDomainKey(domain)] = addonDomainMeta{Domain: domain}
 	}
 }
 
