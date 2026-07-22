@@ -53,7 +53,7 @@ func TestDeleteSubdomainFallsBackToStateValue(t *testing.T) {
 func TestAddonDomainCacheTracksCreateAndDelete(t *testing.T) {
 	resource := &addonDomainResource{cfg: &providerConfig{
 		addonDomainsLoaded: true,
-		addonDomains:       map[string]struct{}{"existing.example": {}},
+		addonDomains:       map[string]addonDomainMeta{"existing.example": {Domain: "existing.example"}},
 	}}
 
 	resource.rememberAddonDomain("New.Example")
@@ -64,5 +64,26 @@ func TestAddonDomainCacheTracksCreateAndDelete(t *testing.T) {
 	resource.forgetAddonDomain("EXISTING.example")
 	if _, ok := resource.cfg.addonDomains["existing.example"]; ok {
 		t.Fatal("deleted domain remained in cache")
+	}
+}
+
+func TestParseAddonDomainListPreservesLiveSubdomain(t *testing.T) {
+	addonDomains, err := parseAddonDomainList(`{
+  "cpanelresult": {
+    "data": [{
+      "domain": "Example.COM",
+      "fullsubdomain": "example-com.account.example"
+    }]
+  }
+}`)
+	if err != nil {
+		t.Fatalf("parseAddonDomainList() error = %v", err)
+	}
+	meta, ok := addonDomains["example.com"]
+	if !ok {
+		t.Fatal("parsed domain is missing")
+	}
+	if meta.FullSubdomain != "example-com.account.example" {
+		t.Fatalf("FullSubdomain = %q", meta.FullSubdomain)
 	}
 }
