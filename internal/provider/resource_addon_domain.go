@@ -71,6 +71,7 @@ func (r *addonDomainResource) Create(ctx context.Context, req resource.CreateReq
 		resp.Diagnostics.AddError("Floki API error", err.Error())
 		return
 	}
+	r.rememberAddonDomain(plan.Domain.ValueString())
 	plan.ID = plan.Domain
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
@@ -124,7 +125,9 @@ func (r *addonDomainResource) Delete(ctx context.Context, req resource.DeleteReq
 
 	if err := r.delAddonDomain(ctx, domain, deleteSubdomain(st.Sub.ValueString(), meta)); err != nil {
 		resp.Diagnostics.AddError("Floki API error", err.Error())
+		return
 	}
+	r.forgetAddonDomain(domain)
 }
 
 func (r *addonDomainResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
@@ -310,6 +313,14 @@ func isWHMNotFound(msg string) bool {
 }
 
 func (r *addonDomainResource) domainExists(ctx context.Context, domain string) (bool, error) {
+	r.cfg.addonDomainsMu.Lock()
+	defer r.cfg.addonDomainsMu.Unlock()
+
+	if r.cfg.addonDomainsLoaded {
+		_, ok := r.cfg.addonDomains[normalizeDomainKey(domain)]
+		return ok, nil
+	}
+
 	_, body, err := r.call(ctx, "GET", "/execute/DomainInfo/list_domains", nil)
 	if err != nil {
 		return false, err
@@ -322,12 +333,34 @@ func (r *addonDomainResource) domainExists(ctx context.Context, domain string) (
 	if err := json.Unmarshal([]byte(body), &out); err != nil {
 		return strings.Contains(strings.ToLower(body), strings.ToLower(domain)), nil
 	}
+
+	r.cfg.addonDomains = make(map[string]struct{}, len(out.Data.AddonDomains))
 	for _, s := range out.Data.AddonDomains {
-		if strings.EqualFold(s, domain) {
-			return true, nil
-		}
+		r.cfg.addonDomains[normalizeDomainKey(s)] = struct{}{}
 	}
-	return false, nil
+	r.cfg.addonDomainsLoaded = true
+	_, ok := r.cfg.addonDomains[normalizeDomainKey(domain)]
+	return ok, nil
+}
+
+func (r *addonDomainResource) rememberAddonDomain(domain string) {
+	r.cfg.addonDomainsMu.Lock()
+	defer r.cfg.addonDomainsMu.Unlock()
+	if r.cfg.addonDomainsLoaded {
+		r.cfg.addonDomains[normalizeDomainKey(domain)] = struct{}{}
+	}
+}
+
+func (r *addonDomainResource) forgetAddonDomain(domain string) {
+	r.cfg.addonDomainsMu.Lock()
+	defer r.cfg.addonDomainsMu.Unlock()
+	if r.cfg.addonDomainsLoaded {
+		delete(r.cfg.addonDomains, normalizeDomainKey(domain))
+	}
+}
+
+func normalizeDomainKey(domain string) string {
+	return strings.ToLower(strings.TrimSpace(domain))
 }
 
 func (r *addonDomainResource) call(ctx context.Context, method, p string, q url.Values) (int, string, error) {

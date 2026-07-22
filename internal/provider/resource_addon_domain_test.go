@@ -49,3 +49,20 @@ func TestDeleteSubdomainFallsBackToStateValue(t *testing.T) {
 		t.Fatalf("deleteSubdomain() = %q, want state value", got)
 	}
 }
+
+func TestAddonDomainCacheTracksCreateAndDelete(t *testing.T) {
+	resource := &addonDomainResource{cfg: &providerConfig{
+		addonDomainsLoaded: true,
+		addonDomains:       map[string]struct{}{"existing.example": {}},
+	}}
+
+	resource.rememberAddonDomain("New.Example")
+	if _, ok := resource.cfg.addonDomains["new.example"]; !ok {
+		t.Fatal("created domain was not added to cache")
+	}
+
+	resource.forgetAddonDomain("EXISTING.example")
+	if _, ok := resource.cfg.addonDomains["existing.example"]; ok {
+		t.Fatal("deleted domain remained in cache")
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -48,6 +49,10 @@ type providerConfig struct {
 	BaseBackoff    time.Duration
 	MaxBackoff     time.Duration
 	RequestTimeout time.Duration
+
+	addonDomainsMu     sync.Mutex
+	addonDomainsLoaded bool
+	addonDomains       map[string]struct{}
 }
 
 func New(version string) func() provider.Provider {
