@@ -117,17 +117,59 @@ func (r *addonDomainResource) Delete(ctx context.Context, req resource.DeleteReq
 	}
 
 	domain := st.Domain.ValueString()
-	meta, err := r.fetchAddonDomainMeta(ctx, domain)
+	// Force a fresh listaddondomains lookup instead of reusing this run's
+	// cached snapshot: an earlier Create/Delete elsewhere in the same
+	// apply/destroy can change cPanel's addon-domain <-> subdomain mapping
+	// for domains this resource doesn't own (see delAddonDomainWithVerify),
+	// and the cache - added purely to cut down on repeated listaddondomains
+	// calls during Read - doesn't know that. A mutating operation like
+	// Delete needs the true current mapping, not a stale one.
+	meta, err := r.fetchAddonDomainMeta(ctx, domain, true)
 	if err != nil {
 		resp.Diagnostics.AddError("Floki API error", fmt.Sprintf("Unable to read addon-domain mapping for %s: %s", domain, err))
 		return
 	}
 
-	if err := r.delAddonDomain(ctx, domain, deleteSubdomain(st.Sub.ValueString(), meta)); err != nil {
+	if err := r.delAddonDomainWithVerify(ctx, domain, deleteSubdomain(st.Sub.ValueString(), meta)); err != nil {
 		resp.Diagnostics.AddError("Floki API error", err.Error())
 		return
 	}
 	r.forgetAddonDomain(domain)
+}
+
+// delAddonDomainWithVerify calls delAddonDomain, and if it fails with the
+// "subdomain does not correspond to domain" class of error, checks cPanel's
+// live state before giving up. cPanel can end up applying the deletion (or
+// have already applied it from a prior run) while still returning an error
+// for this specific call, because the subdomain binding it expects has since
+// changed as a side effect of other addon-domain operations earlier in this
+// same apply/destroy - exactly the failure mode this class of error reports.
+// If the domain is confirmed gone, this is success, not failure. If it's
+// still there under a different subdomain, retry once with that current
+// value instead of the stale one that just failed.
+func (r *addonDomainResource) delAddonDomainWithVerify(ctx context.Context, domain, subdomain string) error {
+	err := r.delAddonDomain(ctx, domain, subdomain)
+	if err == nil {
+		return nil
+	}
+	if !isCPDeletePermissionError(strings.ToLower(err.Error())) {
+		return err
+	}
+
+	addonDomains, refreshErr := r.loadAddonDomains(ctx, true)
+	if refreshErr != nil {
+		// Can't verify current state - surface the original error rather
+		// than mask a real failure.
+		return err
+	}
+	fresh, stillExists := addonDomains[normalizeDomainKey(domain)]
+	if !stillExists {
+		return nil
+	}
+	if strings.TrimSpace(fresh.FullSubdomain) != "" && !strings.EqualFold(fresh.FullSubdomain, subdomain) {
+		return r.delAddonDomain(ctx, domain, fresh.FullSubdomain)
+	}
+	return err
 }
 
 func (r *addonDomainResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
@@ -211,7 +253,7 @@ func isCPDeletePermissionError(msgLower string) bool {
 }
 
 func (r *addonDomainResource) whmDeleteAddonDomain(ctx context.Context, domain string) error {
-	meta, err := r.fetchAddonDomainMeta(ctx, domain)
+	meta, err := r.fetchAddonDomainMeta(ctx, domain, true)
 	if err != nil {
 		return fmt.Errorf("whm fallback metadata lookup failed for %s: %w", domain, err)
 	}
@@ -244,8 +286,8 @@ func deleteSubdomain(stateSubdomain string, meta *addonDomainMeta) string {
 	return stateSubdomain
 }
 
-func (r *addonDomainResource) fetchAddonDomainMeta(ctx context.Context, domain string) (*addonDomainMeta, error) {
-	addonDomains, err := r.loadAddonDomains(ctx)
+func (r *addonDomainResource) fetchAddonDomainMeta(ctx context.Context, domain string, forceRefresh bool) (*addonDomainMeta, error) {
+	addonDomains, err := r.loadAddonDomains(ctx, forceRefresh)
 	if err != nil {
 		return nil, err
 	}
@@ -255,11 +297,18 @@ func (r *addonDomainResource) fetchAddonDomainMeta(ctx context.Context, domain s
 	return &addonDomainMeta{Domain: domain}, nil
 }
 
-func (r *addonDomainResource) loadAddonDomains(ctx context.Context) (map[string]addonDomainMeta, error) {
+// loadAddonDomains returns this run's cached listaddondomains snapshot,
+// fetching it fresh on first use. Pass forceRefresh for any mutating
+// decision (Delete) that needs the true current state rather than a
+// snapshot that may have been invalidated by other operations earlier in
+// the same apply/destroy; Read-path callers (domainExists) can keep using
+// the cache, since a plan/refresh doesn't need to react instantly to
+// concurrent changes.
+func (r *addonDomainResource) loadAddonDomains(ctx context.Context, forceRefresh bool) (map[string]addonDomainMeta, error) {
 	r.cfg.addonDomainsMu.Lock()
 	defer r.cfg.addonDomainsMu.Unlock()
 
-	if r.cfg.addonDomainsLoaded {
+	if r.cfg.addonDomainsLoaded && !forceRefresh {
 		return r.cfg.addonDomains, nil
 	}
 
@@ -340,7 +389,7 @@ func isWHMNotFound(msg string) bool {
 }
 
 func (r *addonDomainResource) domainExists(ctx context.Context, domain string) (bool, error) {
-	addonDomains, err := r.loadAddonDomains(ctx)
+	addonDomains, err := r.loadAddonDomains(ctx, false)
 	if err != nil {
 		return false, err
 	}
